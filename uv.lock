@@ -91,7 +91,7 @@ wheels = [
 ]
 
 [[package]]
-name = "distributed-computing"
+name = "distributed-inference-on-multi-device"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
