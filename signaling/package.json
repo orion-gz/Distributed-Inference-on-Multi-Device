@@ -1,0 +1,12 @@
+{
+  "name": "signaling",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "description": "WebRTC signaling server for midm-distributed",
+  "main": "signaling.js",
+  "packages": {},
+  "scripts": {
+    "start": "node signaling.js"
+  }
+}
