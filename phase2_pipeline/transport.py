@@ -28,23 +28,21 @@ import torch
 # dtype id ↔ numpy dtype mapping
 _DTYPE_TO_ID = {"float16": 0, "bfloat16": 1, "float32": 2}
 _ID_TO_DTYPE = {v: k for k, v in _DTYPE_TO_ID.items()}
-_ID_TO_NP = {0: np.float16, 1: np.float32, 2: np.float32}  # bfloat16 → fp32 for numpy
-
 
 def encode(tensor: torch.Tensor) -> bytes:
     """tensor → bytes"""
     dtype_str = str(tensor.dtype).replace("torch.", "")
     dtype_id = _DTYPE_TO_ID.get(dtype_str, 2)
-
-    arr = tensor.detach().cpu()
+    t = tensor.detach().cpu().contiguous()
+    
     if tensor.dtype == torch.bfloat16:
-        arr = arr.float()
-    arr = arr.numpy()
+        arr = t.view(torch.int16).numpy()
+    else:
+        arr = t.numpy()
 
     shape = arr.shape
     header = struct.pack(f">BB{len(shape)}I", dtype_id, len(shape), *shape)
     return header + arr.tobytes()
-
 
 def decode(data: bytes, device: str = "cuda") -> torch.Tensor:
     """bytes → tensor"""
@@ -52,16 +50,17 @@ def decode(data: bytes, device: str = "cuda") -> torch.Tensor:
     ndim = struct.unpack(">B", data[1:2])[0]
     shape = struct.unpack(f">{ndim}I", data[2 : 2 + ndim * 4])
     payload = data[2 + ndim * 4 :]
-
-    np_dtype = _ID_TO_NP[dtype_id]
-    arr = np.frombuffer(payload, dtype=np_dtype).reshape(shape).copy()
-    tensor = torch.from_numpy(arr).to(device)
-
     original = _ID_TO_DTYPE[dtype_id]
-    if original == "float16":
-        tensor = tensor.half()
-    elif original == "bfloat16":
-        tensor = tensor.bfloat16()
+
+    if original == "bfloat16":
+        arr = np.frombuffer(payload, dtype=np.int16).reshape(shape).copy()
+        tensor = torch.from_numpy(arr).view(torch.bfloat16).to(device)
+    elif original == "float16":
+        arr = np.frombuffer(payload, dtype=np.float16).reshape(shape).copy()
+        tensor = torch.from_numpy(arr).to(device).half()
+    else:
+        arr    = np.frombuffer(payload, dtype=np.float32).reshape(shape).copy()
+        tensor = torch.from_numpy(arr).to(device)
 
     return tensor
 

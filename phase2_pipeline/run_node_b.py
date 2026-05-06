@@ -28,8 +28,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transport import recv_tensor
 
 DEFAULT_MODEL = "K-intelligence/Midm-2.0-Base-Instruct"
-LISTEN_HOST   = "0.0.0.0"
-LISTEN_PORT   = 9000
+LISTEN_HOST = "0.0.0.0"
+LISTEN_PORT = 9000
+
+PHASE_PREFILL = 0
+PHASE_DECODE = 1
+PHASE_END = 255
 
 
 def load_model(model_id: str):
@@ -41,23 +45,6 @@ def load_model(model_id: str):
     model.eval()
     return tokenizer, model
 
-
-def recv_step(conn: socket.socket, device: str):
-    raw = conn.recv(4)
-    if len(raw) < 4:
-        return None, None
-    n = struct.unpack(">I", raw)[0]
-    if n == 0:
-        return None, None 
-
-    raw_ids = _recv_exact(conn, n * 4)
-    ids     = list(struct.unpack(f">{n}i", raw_ids))
-    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
-
-    activation = recv_tensor(conn, device=device)
-    return input_ids, activation
-
-
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
@@ -67,9 +54,25 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
         buf.extend(chunk)
     return bytes(buf)
 
+def recv_step(conn: socket.socket, device: str):
+    raw = _recv_exact(conn, 1)
+    phase = struct.unpack(">B", raw)[0]
 
-def device_b_forward(model, activation: torch.Tensor,
-                     split_layer: int, input_ids: torch.Tensor) -> int:
+    if phase == PHASE_END:
+        return PHASE_END, None, None
+
+    raw_n = _recv_exact(conn, 4)
+    n = struct.unpack(">I", raw_n)[0]
+    
+    raw_ids = _recv_exact(conn, n * 4)
+    ids = list(struct.unpack(f">{n}i", raw_ids))
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    
+    activation = recv_tensor(conn, device=device)
+    return phase, input_ids, activation
+
+def device_b_forward(model, activation: torch.Tensor, split_layer: int, input_ids: torch.Tensor, past_kv=None) -> int:
+    layer_dtype = next
     injected = [False]
 
     def _inject(module, args, kwargs):
@@ -86,13 +89,15 @@ def device_b_forward(model, activation: torch.Tensor,
     )
     try:
         with torch.no_grad():
-            outputs = model.model(input_ids, use_cache=False)
-        hidden = model.model.norm(outputs.last_hidden_state)
+            outputs = model.model(input_ids, past_key_values=past_kv, use_cache=True)
+        lm_dtype = model.lm_head.weight.dtype
+        hidden = model.model.norm(outputs.last_hidden_state).to(lm_dtype)
         logits = model.lm_head(hidden)
     finally:
         handle.remove()
 
-    return logits[0, -1].argmax().item()
+    next_id = logits[0, -1].argmax().item()
+    return next_id, outputs.past_key_values
 
 
 def serve(tokenizer, model, split_layer: int, host: str, port: int):
@@ -107,25 +112,31 @@ def serve(tokenizer, model, split_layer: int, host: str, port: int):
         while True:
             conn, addr = server.accept()
             print(f"\nDevice A connected: {addr}")
+
+            past_kv = None
             step = 0
 
             with conn:
                 while True:
                     t0 = time.perf_counter()
-                    input_ids, activation = recv_step(conn, device)
+                    phase, input_ids, activation = recv_step(conn, device)
 
-                    if input_ids is None:
+                    if phase == PHASE_END:
                         print("Session ended")
                         break
 
                     recv_ms = (time.perf_counter() - t0) * 1000
 
+                    if phase == PHASE_PREFILL:
+                        past_kv = None
+                        
                     t1 = time.perf_counter()
-                    next_id = device_b_forward(model, activation, split_layer, input_ids)
+                    next_id, past_kv = device_b_forward(model, activation, split_layer, input_ids, past_kv)
                     infer_ms = (time.perf_counter() - t1) * 1000
 
+                    label = "prefill" if phase == PHASE_PREFILL else "decode"
                     tok_str = tokenizer.decode([next_id])
-                    print(f"[{step+1:3d}] '{tok_str}'  "
+                    print(f"[{step+1:3d}][{label}] '{tok_str}'  "
                           f"recv={recv_ms:.0f}ms  infer={infer_ms:.0f}ms")
                     step += 1
 

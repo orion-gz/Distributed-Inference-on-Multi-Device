@@ -4,8 +4,9 @@ run_node_a.py
 ==============
 
 device_a_forward():
-    device_a_forward executes the full forward with 'output_hidden_states=True' and extracts 'hidden_states[split_layer]' as the activation.
-    This is the same method as run_baseline in split_inference.py
+    If past_kv=None, it is Prefill; otherwise, it is Decode.
+    In the Decode stage, input_ids is (1, 1) with a single token, and the previous context is passed via past_key_values. 
+    The shape of hidden_states[split_layer] is fixed at (1, 1, 4096), so the payload is 8KB.
     
 send_step():
     The reason for sending token IDs is that Node B uses a hook injection method, so input_ids are needed to run the entire forward.
@@ -26,8 +27,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transport import recv_tensor, send_tensor
 
 DEFAULT_MODEL = "K-intelligence/Midm-2.0-Base-Instruct"
-NODE_B_HOST   = "127.0.0.1"
-NODE_B_PORT   = 9000
+NODE_B_HOST = "127.0.0.1"
+NODE_B_PORT = 9000
+
+PHASE_PREFILL = 0
+PHASE_DECODE = 1
+PHASE_END = 255
 
 
 def load_model(model_id: str):
@@ -42,38 +47,47 @@ def load_model(model_id: str):
     return tokenizer, model
 
 
-def device_a_forward(model, input_ids: torch.Tensor, split_layer: int) -> torch.Tensor:
-    """Embedding + Layer 0..split_layer-1 실행, activation 반환"""
+def device_a_forward(model, input_ids: torch.Tensor, split_layer: int, past_kv=None) -> torch.Tensor:
     with torch.no_grad():
-        outputs = model.model(input_ids, output_hidden_states=True, use_cache=False)
-    # hidden_states[k] = output after layer k-1
-    return outputs.hidden_states[split_layer]
+        outputs = model.model(input_ids, past_key_values=past_kv, output_hidden_states=True, use_cache=True)
+    activation = outputs.hidden_states[split_layer].bfloat16()
+    return activation, outputs.past_key_values
 
 
-def send_step(sock: socket.socket, input_ids: torch.Tensor, activation: torch.Tensor):
+def send_step(sock: socket.socket, phase: int, input_ids: torch.Tensor, activation: torch.Tensor):
     ids = input_ids[0].cpu().tolist()
     n   = len(ids)
-    sock.sendall(struct.pack(f">I{n}i", n, *ids))
+    sock.sendall(struct.pack(f">BI{n}i", phase, n, *ids))
     sent = send_tensor(sock, activation)
-    return sent
+    return 1 + 4 + n * 4 + sent
 
 
 def generate(tokenizer, model, text: str, split_layer: int,
              max_new_tokens: int, node_b_addr: tuple) -> str:
 
-    input_ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device)
-    print(f"\nInput: '{text}'  ({input_ids.shape[1]} tokens)")
+    prompt_ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device)
+    print(f"\nInput: '{text}'  ({prompt_ids.shape[1]} tokens)")
     print(f"Connecting to Device B {node_b_addr} ...")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect(node_b_addr)
         print("Connected.\n")
 
+        past_kv = None
+        input_ids = prompt_ids.clone()
+        generated = []
+        
         for step in range(max_new_tokens):
             t0 = time.perf_counter()
-
-            activation = device_a_forward(model, input_ids, split_layer)
-            sent_b     = send_step(s, input_ids, activation)
+            phase = PHASE_PREFILL if step == 0 else PHASE_DECODE
+            
+            if step > 0:
+                input_ids = torch.tensor([[generated[-1]]], device=model.device)
+                
+            activation, past_kv = device_a_forward(
+                model, input_ids, split_layer, past_kv
+            )
+            sent_b = send_step(s, phase, input_ids, activation)
 
             raw = s.recv(4)
             if len(raw) < 4:
@@ -81,22 +95,19 @@ def generate(tokenizer, model, text: str, split_layer: int,
                 break
             next_id = struct.unpack(">I", raw)[0]
 
-            ms      = (time.perf_counter() - t0) * 1000
+            ms = (time.perf_counter() - t0) * 1000
             tok_str = tokenizer.decode([next_id])
-            print(f"[{step+1:3d}] '{tok_str}'  A={ms:.0f}ms  payload={sent_b/1024:.1f}KB")
+            label = "prefill" if phase == PHASE_PREFILL else "decode"
+            print(f"[{step+1:3d}][{label}] '{tok_str}'  A={ms:.0f}ms  payload={sent_b/1024:.1f}KB")
 
             if next_id == tokenizer.eos_token_id:
                 print("\n[EOS]")
                 break
+            
+            generated.append(next_id)
+        s.sendall(struct.pack(">B", PHASE_END))  
 
-            input_ids = torch.cat(
-                [input_ids, torch.tensor([[next_id]], device=model.device)], dim=1
-            )
-
-        s.sendall(struct.pack(">I", 0))  
-
-    prompt_len = tokenizer(text, return_tensors="pt").input_ids.shape[1]
-    return tokenizer.decode(input_ids[0, prompt_len:], skip_special_tokens=True)
+    return tokenizer.decode(generated, skip_special_tokens=True)
 
 
 if __name__ == "__main__":
@@ -110,6 +121,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     tokenizer, model = load_model(args.model)
-    result = generate(tokenizer, model, args.text, args.split,
-                      args.max_tokens, (args.host, args.port))
-    print(f"\n=== 생성 결과 ===\n{result}")
+    result = generate(
+        tokenizer, model, args.text, 
+        args.split, args.max_tokens, 
+        (args.host, args.port)
+    )
+    print(f"\n=== Generated Result ===\n{result}")
